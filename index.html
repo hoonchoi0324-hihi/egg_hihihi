@@ -173,6 +173,7 @@ h1{font-family:Galmuri14,Galmuri11,sans-serif;font-weight:400;color:var(--px-red
   <div id="plist"></div>
   <label class="small" id="botLbl"><input type="checkbox" id="botFill" checked> 빈자리는 봇으로 채우기</label>
   <div class="row"><button id="bStart" class="red">시작</button><button id="bLeave">나가기</button></div>
+  <button id="bMic" class="hidden" onclick="Voice.toggle()">마이크 켜기</button>
   <div id="chatBox"></div>
   <div class="row"><input id="roomChat" maxlength="60" placeholder="채팅" style="width:min(520px,70vw)"><button id="bSay">보내기</button></div>
 </div>
@@ -948,7 +949,7 @@ function enterRoomUI(){
   clearSubs();show('room');
   $('roomTitle').textContent=(room.solo?'혼자 연습':'방 코드 '+room.code);
   unsubs.push(Net.on(rp('info'),info=>{if(!info){leaveRoom('방이 없어졌어요.');return;}room.info=info;
-    $('roomType').textContent=room.solo?'봇이 나머지 자리를 채워요':(info.type==='quiet'?'쉿!방 · 마이크 없음 (글자 채팅만)':'자유방 · 마이크 켜짐 (마이크는 다음 판에 들어가요 · 지금은 글자 채팅)');
+    $('roomType').textContent=room.solo?'봇이 나머지 자리를 채워요':(info.type==='quiet'?'쉿!방 · 마이크 없음 (글자 채팅만)':'자유방 · 마이크로 말할 수 있어요 (아래 마이크 켜기, PC는 V)');
     $('bStart').disabled=info.host!==myId;$('botLbl').classList.toggle('hidden',room.solo||info.host!==myId);
     if(info.state==='play'&&!G)startGame();
     if(info.state==='end'&&G)showResult();}));
@@ -971,6 +972,7 @@ function say(t){t=(t||'').trim();if(!t||!room)return;if(room.solo){addChat({n:ni
 $('bSay').onclick=()=>{say($('roomChat').value);$('roomChat').value='';};
 $('roomChat').addEventListener('keydown',e=>{if(e.key==='Enter'){say($('roomChat').value);$('roomChat').value='';}});
 async function leaveRoom(msg){
+  try{Voice.leave();}catch(e){}
   if(room&&Net){if(room.info&&room.info.host===myId&&room.info.state==='lobby')await Net.remove('rooms/'+room.code);else{await Net.remove(rp('players/'+myId));await Net.remove(rp('st/'+myId));}}
   endGameLocal();clearSubs();room=null;show('menu');$('netMsg').textContent=msg||'';listRooms();
 }
@@ -1526,6 +1528,7 @@ function dialItems(){
   if(R==='mechanic')L.push({id:'c',t:'제작',s:`부품 ${me.parts}`});
   weaponList(me).forEach(x=>{if(x==='knife')return;L.push({id:'w:'+x,t:WEAPON[x].n.replace('군용 ',''),s:weaponCount(x),cd:'w_'+x,on:x===me.sel});});
   L.push({id:'f',t:'손전등',s:me.flash?'켜짐':'꺼짐'});
+  if(Voice.allowed())L.push({id:'mic',t:'마이크',s:Voice.isOn()?'켜짐':'꺼짐',on:Voice.isOn()});
   L.push({id:'snd',t:'소리',s:HS.isMuted()?'꺼짐':'켜짐'});
   L.push({id:'chat',t:'채팅',s:''});
   L.push({id:'esc',t:'나가기',s:''});
@@ -1543,6 +1546,7 @@ function dialHot(x,y){let best=null,bd=46;$('dial').querySelectorAll('.di').forE
 function dialRun(id){if(!me)return;
   if(id==='fire')onFire();else if(id==='q'||id==='r')ability(me,id);else if(id==='f')me.flash=!me.flash;
   else if(id==='snd')toggleMute();
+  else if(id==='mic')Voice.toggle();
   else if(id==='c'){if(me.role==='mechanic')toggleCraft();}
   else if(id==='chat'){$('chatIn').classList.remove('hidden');$('chatIn').focus();}
   else if(id==='esc'){if(confirm('그만하고 나갈까?'))leaveRoom();}
@@ -1847,6 +1851,85 @@ function doorSounds(){
 }
 
 /* =====================================================================
+   마이크 (자유방만) — WebRTC로 서로 바로 연결, Firebase는 연결 쪽지만 전달 (rooms/코드/rtc/받는사람)
+   판 안에서는 가까운 사람 목소리만 크게 (같은 층 3m 안은 그대로, 18m 넘으면 안 들림). 죽거나 탈출하면 다 들림
+   ===================================================================== */
+const Voice=(()=>{
+  const ICE={iceServers:[{urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302','stun:stun2.l.google.com:19302']}]};
+  let on=false,joined=false,mic=null,actx=null,peers={},unsub=null,code=null,busy=false;
+  const allowed=()=>!!(room&&!room.solo&&room.info&&room.info.type!=='quiet'&&Net&&myId&&window.RTCPeerConnection);
+  function ac(){if(!actx){try{actx=new(window.AudioContext||window.webkitAudioContext)();}catch(e){}}if(actx&&actx.state!=='running')actx.resume();return actx;}
+  addEventListener('pointerdown',()=>{if(actx&&actx.state!=='running')actx.resume();});
+  const inbox=id=>'rooms/'+code+'/rtc/'+id;
+  function send(to,m){m.from=myId;m.ts=Net.now();Net.push(inbox(to),m);}
+  function mk(id){
+    if(peers[id])return peers[id];
+    const pc=new RTCPeerConnection(ICE),tr=pc.addTransceiver('audio',{direction:'sendrecv'});
+    const p={pc,tr,id,gain:null,el:null,q:[]};peers[id]=p;
+    if(mic)tr.sender.replaceTrack(mic.getAudioTracks()[0]).catch(()=>{});
+    pc.onicecandidate=e=>{if(e.candidate)send(id,{t:'ice',c:JSON.stringify(e.candidate)});};
+    pc.ontrack=e=>{const st=(e.streams&&e.streams[0])||new MediaStream([e.track]);
+      const el=new Audio();el.autoplay=true;el.playsInline=true;el.srcObject=st;p.el=el;
+      const c=ac();
+      if(c&&c.createMediaStreamSource){el.muted=true;el.play().catch(()=>{});   // 크롬은 소리 태그에도 붙여야 소리가 흐름
+        try{const src=c.createMediaStreamSource(st),g=c.createGain();g.gain.value=1;src.connect(g);g.connect(c.destination);p.gain=g;}catch(err){el.muted=false;}}
+      else el.play().catch(()=>{});
+      voiceUI();};
+    pc.onconnectionstatechange=()=>{if(pc.connectionState==='failed'||pc.connectionState==='closed')drop(id);voiceUI();};
+    return p;}
+  async function call(id){try{const p=mk(id),o=await p.pc.createOffer();await p.pc.setLocalDescription(o);send(id,{t:'offer',sdp:o.sdp});}catch(e){}}
+  async function onMsg(k,m){
+    Net.remove(inbox(myId)+'/'+k);if(!m||!m.from||m.from===myId||Net.now()-(m.ts||0)>30000)return;const id=m.from;
+    try{
+      if(m.t==='offer'){if(peers[id]&&peers[id].pc.signalingState!=='stable')drop(id);const p=mk(id);
+        await p.pc.setRemoteDescription({type:'offer',sdp:m.sdp});const a=await p.pc.createAnswer();await p.pc.setLocalDescription(a);send(id,{t:'answer',sdp:a.sdp});
+        p.q.forEach(c=>p.pc.addIceCandidate(c).catch(()=>{}));p.q=[];}
+      else if(m.t==='answer'){const p=peers[id];if(p&&p.pc.signalingState==='have-local-offer'){await p.pc.setRemoteDescription({type:'answer',sdp:m.sdp});p.q.forEach(c=>p.pc.addIceCandidate(c).catch(()=>{}));p.q=[];}}
+      else if(m.t==='ice'){const c=JSON.parse(m.c),p=mk(id);if(p.pc.remoteDescription)p.pc.addIceCandidate(c).catch(()=>{});else p.q.push(c);}
+    }catch(e){}}
+  function drop(id){const p=peers[id];if(!p)return;delete peers[id];try{p.pc.close();}catch(e){}try{p.gain&&p.gain.disconnect();}catch(e){}if(p.el){p.el.srcObject=null;}}
+  function join(){code=room.code;unsub=Net.onChild(inbox(myId),{add:onMsg});joined=true;}
+  function leave(){Object.keys(peers).forEach(drop);if(unsub){try{unsub();}catch(e){}}unsub=null;joined=false;code=null;
+    if(mic){mic.getTracks().forEach(t=>t.stop());mic=null;}on=false;voiceUI();}
+  function sync(){
+    if(!allowed()){if(joined)leave();voiceUI();return;}
+    if(joined&&code!==room.code)leave();
+    if(!joined)join();
+    const ids=Object.keys(room.players||{}).filter(x=>x!==myId);
+    ids.forEach(id=>{if(!peers[id]&&myId<id)call(id);});   // 아이디가 작은 쪽이 먼저 전화 (서로 동시에 걸지 않게)
+    Object.keys(peers).forEach(id=>{if(!ids.includes(id))drop(id);});
+    voiceUI();}
+  async function toggle(){
+    if(busy)return;if(!allowed()){feed&&G?feed('이 방은 마이크를 못 써요','#aaa'):($('roomType').textContent='쉿!방이나 혼자 연습은 마이크가 없어요');return;}
+    ac();busy=true;
+    try{
+      if(!on){
+        try{mic=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});}
+        catch(e){const msg=location.protocol!=='https:'?'마이크는 https 주소에서만 돼요':'마이크 권한을 허락해 주세요 (주소창 옆 자물쇠 → 마이크 허용)';if(G)feed(msg,'#ff8a80');else $('roomType').textContent=msg;return;}
+        on=true;const tk=mic.getAudioTracks()[0];Object.values(peers).forEach(p=>p.tr.sender.replaceTrack(tk).catch(()=>{}));
+        if(G)feed('마이크 켜짐 (V)','#7dcea0');
+      }else{
+        on=false;Object.values(peers).forEach(p=>p.tr.sender.replaceTrack(null).catch(()=>{}));mic.getTracks().forEach(t=>t.stop());mic=null;
+        if(G)feed('마이크 꺼짐 (V)','#aaa');
+      }
+    }finally{busy=false;voiceUI();}}
+  function tick(){
+    if(!actx)return;const t=actx.currentTime;
+    for(const p of Object.values(peers)){if(!p.gain)continue;let v=1;
+      if(G&&me){const gone=me.status==='dead'||me.status==='sac'||me.escaped;const e=ents[p.id];
+        if(e&&!gone){const st=(e.st||{}).st;const eg=st==='dead'||st==='sac'||st==='esc';
+          if(eg)v=0;   // 죽은 사람 목소리는 산 사람에게 안 들림
+          else{const d=Math.hypot(e.x-me.x,e.z-me.z);v=(e.fl||0)!==me.fl?0:clamp(1-(d-3)/15,0,1);}}}
+      p.gain.gain.setTargetAtTime(v,t,0.15);}}
+  const connected=()=>Object.values(peers).filter(p=>p.pc.connectionState==='connected').length;
+  setInterval(()=>{try{sync();}catch(e){}},1500);
+  return{toggle,sync,leave,tick,allowed,isOn:()=>on,connected};
+})();
+function voiceUI(){const b=$('bMic');if(!b)return;const ok=Voice.allowed();b.classList.toggle('hidden',!ok);
+  const n=Voice.connected();b.textContent=(Voice.isOn()?'마이크 끄기':'마이크 켜기')+(ok?` · 연결 ${n}명`:'');b.classList.toggle('red',Voice.isOn());}
+addEventListener('keydown',e=>{if(e.code==='KeyV'&&!e.repeat&&!(document.activeElement&&/INPUT|TEXTAREA/.test(document.activeElement.tagName)))Voice.toggle();});
+
+/* =====================================================================
    화면 (HUD)
    ===================================================================== */
 function feed(t,col){const d=document.createElement('div');d.textContent=t;d.style.color=col||'#ddd';$('feed').appendChild(d);while($('feed').children.length>7)$('feed').firstChild.remove();setTimeout(()=>{d.style.opacity=0;setTimeout(()=>d.remove(),1000);},6500);}
@@ -1996,7 +2079,7 @@ function frame(t){
   stepKnives(dt);stepTurrets(dt);
   // 문 열림 애니메이션
   for(const d of Object.values(W.doors)){const o=d.ang;d.ang=lerp(d.ang,d.open?1:0,Math.min(1,dt*(d.shutter?1.5:6)));if(Math.abs(o-d.ang)>0.01)lampT=Math.min(lampT,0.15);}
-  hostCheck(dt);heartbeat(dt);footsteps(dt);doorSounds();drawTrapGame(dt);updateHud(dt);render2D(nowS,dt);
+  hostCheck(dt);heartbeat(dt);footsteps(dt);doorSounds();Voice.tick();drawTrapGame(dt);updateHud(dt);render2D(nowS,dt);
   if(!started)$('center').textContent=`${Math.ceil((G.startAt-nowS)/1000)}`;else if($('center').textContent&&!G.centerMsg)$('center').textContent='';
 }
 requestAnimationFrame(frame);

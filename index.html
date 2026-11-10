@@ -1858,36 +1858,37 @@ const Voice=(()=>{
   const ICE={iceServers:[{urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302','stun:stun2.l.google.com:19302']}]};
   let on=false,joined=false,mic=null,actx=null,peers={},unsub=null,code=null,busy=false;
   const allowed=()=>!!(room&&!room.solo&&room.info&&room.info.type!=='quiet'&&Net&&myId&&window.RTCPeerConnection);
-  function ac(){if(!actx){try{actx=new(window.AudioContext||window.webkitAudioContext)();}catch(e){}}if(actx&&actx.state!=='running')actx.resume();return actx;}
-  addEventListener('pointerdown',()=>{if(actx&&actx.state!=='running')actx.resume();});
+  function ac(){return null;}
+  const waiting=new Set();   // 브라우저가 "화면을 눌러야 소리 재생" 해서 막힌 것들 → 다음에 누를 때 다시
+  function playEl(el){const r=el.play();if(r&&r.catch)r.catch(()=>waiting.add(el));}
+  const retry=()=>{waiting.forEach(el=>{const r=el.play();if(r&&r.then)r.then(()=>waiting.delete(el)).catch(()=>{});});};
+  addEventListener('pointerdown',retry,true);addEventListener('keydown',retry,true);
   const inbox=id=>'rooms/'+code+'/rtc/'+id;
   function send(to,m){m.from=myId;m.ts=Net.now();Net.push(inbox(to),m);}
-  function mk(id){
+  function mk(id,caller){
     if(peers[id])return peers[id];
-    const pc=new RTCPeerConnection(ICE),tr=pc.addTransceiver('audio',{direction:'sendrecv'});
-    const p={pc,tr,id,gain:null,el:null,q:[]};peers[id]=p;
-    if(mic)tr.sender.replaceTrack(mic.getAudioTracks()[0]).catch(()=>{});
+    const pc=new RTCPeerConnection(ICE),tr=caller?pc.addTransceiver('audio',{direction:'sendrecv'}):null;   // 받는 쪽은 걸려 온 통로를 씀 (따로 만들면 내 목소리가 안 감)
+    const p={pc,tr,id,el:null,q:[]};peers[id]=p;
+    if(mic&&tr)tr.sender.replaceTrack(mic.getAudioTracks()[0]).catch(()=>{});
     pc.onicecandidate=e=>{if(e.candidate)send(id,{t:'ice',c:JSON.stringify(e.candidate)});};
     pc.ontrack=e=>{const st=(e.streams&&e.streams[0])||new MediaStream([e.track]);
-      const el=new Audio();el.autoplay=true;el.playsInline=true;el.srcObject=st;p.el=el;
-      const c=ac();
-      if(c&&c.createMediaStreamSource){el.muted=true;el.play().catch(()=>{});   // 크롬은 소리 태그에도 붙여야 소리가 흐름
-        try{const src=c.createMediaStreamSource(st),g=c.createGain();g.gain.value=1;src.connect(g);g.connect(c.destination);p.gain=g;}catch(err){el.muted=false;}}
-      else el.play().catch(()=>{});
-      voiceUI();};
+      if(!p.el){const el=document.createElement('audio');el.autoplay=true;el.setAttribute('playsinline','');el.style.display='none';document.body.appendChild(el);p.el=el;}
+      p.el.srcObject=st;p.el.muted=false;playEl(p.el);voiceUI();};
     pc.onconnectionstatechange=()=>{if(pc.connectionState==='failed'||pc.connectionState==='closed')drop(id);voiceUI();};
     return p;}
-  async function call(id){try{const p=mk(id),o=await p.pc.createOffer();await p.pc.setLocalDescription(o);send(id,{t:'offer',sdp:o.sdp});}catch(e){}}
+  async function call(id){try{const p=mk(id,true),o=await p.pc.createOffer();await p.pc.setLocalDescription(o);send(id,{t:'offer',sdp:o.sdp});}catch(e){}}
   async function onMsg(k,m){
     Net.remove(inbox(myId)+'/'+k);if(!m||!m.from||m.from===myId||Net.now()-(m.ts||0)>30000)return;const id=m.from;
     try{
-      if(m.t==='offer'){if(peers[id]&&peers[id].pc.signalingState!=='stable')drop(id);const p=mk(id);
-        await p.pc.setRemoteDescription({type:'offer',sdp:m.sdp});const a=await p.pc.createAnswer();await p.pc.setLocalDescription(a);send(id,{t:'answer',sdp:a.sdp});
+      if(m.t==='offer'){if(peers[id]&&peers[id].pc.signalingState!=='stable')drop(id);const p=mk(id,false);
+        await p.pc.setRemoteDescription({type:'offer',sdp:m.sdp});
+        if(!p.tr){p.tr=p.pc.getTransceivers()[0]||null;if(p.tr){p.tr.direction='sendrecv';if(mic)await p.tr.sender.replaceTrack(mic.getAudioTracks()[0]).catch(()=>{});}}
+        const a=await p.pc.createAnswer();await p.pc.setLocalDescription(a);send(id,{t:'answer',sdp:a.sdp});
         p.q.forEach(c=>p.pc.addIceCandidate(c).catch(()=>{}));p.q=[];}
       else if(m.t==='answer'){const p=peers[id];if(p&&p.pc.signalingState==='have-local-offer'){await p.pc.setRemoteDescription({type:'answer',sdp:m.sdp});p.q.forEach(c=>p.pc.addIceCandidate(c).catch(()=>{}));p.q=[];}}
-      else if(m.t==='ice'){const c=JSON.parse(m.c),p=mk(id);if(p.pc.remoteDescription)p.pc.addIceCandidate(c).catch(()=>{});else p.q.push(c);}
+      else if(m.t==='ice'){const c=JSON.parse(m.c),p=mk(id,myId<id);if(p.pc.remoteDescription)p.pc.addIceCandidate(c).catch(()=>{});else p.q.push(c);}
     }catch(e){}}
-  function drop(id){const p=peers[id];if(!p)return;delete peers[id];try{p.pc.close();}catch(e){}try{p.gain&&p.gain.disconnect();}catch(e){}if(p.el){p.el.srcObject=null;}}
+  function drop(id){const p=peers[id];if(!p)return;delete peers[id];try{p.pc.close();}catch(e){}if(p.el){p.el.srcObject=null;waiting.delete(p.el);p.el.remove();}}
   function join(){code=room.code;unsub=Net.onChild(inbox(myId),{add:onMsg});joined=true;}
   function leave(){Object.keys(peers).forEach(drop);if(unsub){try{unsub();}catch(e){}}unsub=null;joined=false;code=null;
     if(mic){mic.getTracks().forEach(t=>t.stop());mic=null;}on=false;voiceUI();}
@@ -1906,24 +1907,24 @@ const Voice=(()=>{
       if(!on){
         try{mic=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});}
         catch(e){const msg=location.protocol!=='https:'?'마이크는 https 주소에서만 돼요':'마이크 권한을 허락해 주세요 (주소창 옆 자물쇠 → 마이크 허용)';if(G)feed(msg,'#ff8a80');else $('roomType').textContent=msg;return;}
-        on=true;const tk=mic.getAudioTracks()[0];Object.values(peers).forEach(p=>p.tr.sender.replaceTrack(tk).catch(()=>{}));
+        on=true;const tk=mic.getAudioTracks()[0];Object.values(peers).forEach(p=>p.tr&&p.tr.sender.replaceTrack(tk).catch(()=>{}));
         if(G)feed('마이크 켜짐 (V)','#7dcea0');
       }else{
-        on=false;Object.values(peers).forEach(p=>p.tr.sender.replaceTrack(null).catch(()=>{}));mic.getTracks().forEach(t=>t.stop());mic=null;
+        on=false;Object.values(peers).forEach(p=>p.tr&&p.tr.sender.replaceTrack(null).catch(()=>{}));mic.getTracks().forEach(t=>t.stop());mic=null;
         if(G)feed('마이크 꺼짐 (V)','#aaa');
       }
     }finally{busy=false;voiceUI();}}
   function tick(){
-    if(!actx)return;const t=actx.currentTime;
-    for(const p of Object.values(peers)){if(!p.gain)continue;let v=1;
+    for(const p of Object.values(peers)){if(!p.el)continue;let v=1;
       if(G&&me){const gone=me.status==='dead'||me.status==='sac'||me.escaped;const e=ents[p.id];
         if(e&&!gone){const st=(e.st||{}).st;const eg=st==='dead'||st==='sac'||st==='esc';
           if(eg)v=0;   // 죽은 사람 목소리는 산 사람에게 안 들림
           else{const d=Math.hypot(e.x-me.x,e.z-me.z);v=(e.fl||0)!==me.fl?0:clamp(1-(d-3)/15,0,1);}}}
-      p.gain.gain.setTargetAtTime(v,t,0.15);}}
+      p.vol=(p.vol==null?v:p.vol+(v-p.vol)*0.15);try{p.el.volume=clamp(p.vol,0,1);}catch(e){}}}
   const connected=()=>Object.values(peers).filter(p=>p.pc.connectionState==='connected').length;
   setInterval(()=>{try{sync();}catch(e){}},1500);
-  return{toggle,sync,leave,tick,allowed,isOn:()=>on,connected};
+  async function stats(){const o={};for(const [id,p] of Object.entries(peers)){let sent=0,recv=0;(await p.pc.getStats()).forEach(r=>{if(r.type==='outbound-rtp'&&r.kind==='audio')sent+=r.bytesSent||0;if(r.type==='inbound-rtp'&&r.kind==='audio')recv+=r.bytesReceived||0;});o[id]={sent,recv,state:p.pc.connectionState};}return o;}
+  return{toggle,sync,leave,tick,allowed,isOn:()=>on,connected,stats};
 })();
 function voiceUI(){const b=$('bMic');if(!b)return;const ok=Voice.allowed();b.classList.toggle('hidden',!ok);
   const n=Voice.connected();b.textContent=(Voice.isOn()?'마이크 끄기':'마이크 켜기')+(ok?` · 연결 ${n}명`:'');b.classList.toggle('red',Voice.isOn());}
